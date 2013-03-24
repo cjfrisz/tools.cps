@@ -11,6 +11,6 @@ Planned features include:
 
 ## License
 
-Copyright © 2013 FIXME
+Copyright © 2013 Chris Frisz
 
-Distributed under the Eclipse Public License, the same as Clojure.
+Licensed under the EPL (see the file epl.html)
