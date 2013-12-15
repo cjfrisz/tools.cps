@@ -68,6 +68,10 @@
    :site-index -1,
    :tag nil})
 
+(defn unsupported!
+  [expr-str]
+  (throw (Exception. (str expr-str " expressions not supported yet"))))
+
 ;; NB: assuming single-body input fn expressions for now
 ;; NB: assuming only required symbol arguments (no rest or arg destructuring)
 ;; NB: also eschewing compatibility for non-CPS calls
@@ -79,27 +83,27 @@
         (update-in+ [:methods first :body :exprs first]
           #(if (trivial-expr? %)
                (build-invoke-expr k %)
-               (throw (Exception. "serious expression fn bodies not supported yet.")))))))
+               (unsupported! "serious expressions in fn bodies"))))))
     
 (defn cps-expr
   [expr]
   (case (:op expr)
     (:number :boolean :constant :string :keyword) expr
-    :def             (throw (Exception. "def expressions not supported yet."))
+    :def             (unsupported! "def")
     :fn-expr         (cps-fn expr)
-    :if              (throw (Exception. "if expressions not supported yet."))
-    :do              (throw (Exception. "do expressions not supported yet."))
-    :let             (throw (Exception. "let expressions not supported yet."))
-    :invoke          (throw (Exception. "invoke expressions not supported yet."))
-    :recur           (throw (Exception. "recur expressions not supported yet."))
-    :throw           (throw (Exception. "throw expressions not supported yet."))
-    :try             (throw (Exception. "try expressions not supported yet."))
-    :monitor-enter   (throw (Exception. "monitor-enter expressions not supported yet."))
-    :monitor-exit    (throw (Exception. "monitor-exit expressions not supported yet."))
-    :instance-method (throw (Exception. "instance methods invokes not supported yet."))
-    :new             (throw (Exception. "new expressions not supported yet."))
-    :static-method   (throw (Exception. "static-method invokes not supported yet."))
-    (throw (Exception. (str "unsupported expression " expr)))))
+    :if              (unsupported! "if")
+    :do              (unsupported! "do")
+    :let             (unsupported! "let")
+    :invoke          (unsupported! "invoke")
+    :recur           (unsupported! "recur")
+    :throw           (unsupported! "throw")
+    :try             (unsupported! "try")
+    :monitor-enter   (unsupported! "monitor-enter")
+    :monitor-exit    (unsupported! "monitor-exit")
+    :instance-method (unsupported! "instance methods invokes")
+    :new             (unsupported! "new")
+    :static-method   (unsupported! "static-method invokes")
+    (throw (Exception. (str "unexpected expression " expr)))))
 
 (defmacro cps
   [expr]
