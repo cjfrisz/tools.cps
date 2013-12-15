@@ -15,6 +15,6 @@ Copyright © 2013 Chris Frisz
 
 Licensed under the EPL (see the file epl.html)
 
-Includes cdoe from [Clojure TCO](https://github.com/cjfrisz/clojure-tco),
+Includes code from [Clojure TCO](https://github.com/cjfrisz/clojure-tco),
 Copyright © 2013 Chris Frisz, Daniel P. Friedman. See included
 LICENSE.ctco file.
