@@ -4,6 +4,9 @@
 
 ;; NB: probably deficient in the cases covered
 (defn trivial-expr?
+  "Takes an expression (as output by analyze-form) and returns a boolean
+  representing whether the expression is trivial from the point of view of
+  the First Order One Pass CPS algorithm."
   [expr]
   (case (:op expr)
     (:number
@@ -26,6 +29,9 @@
     false))
     
 (defn update-in+
+  "Similar to clojure.core/update-in, except coll may include lists and
+  key* may include references to clojure.core/first so that lists in coll
+  can be traversed."
   [coll key* f & arg*]
   (letfn [($update-in+ [coll key*]
             (if-let [key (first key*)]
@@ -37,6 +43,9 @@
     ($update-in+ coll key*)))
 
 (defn make-fresh-var
+  "Generates an analyzer-style variable expression with a gensym for the
+  variable's symbol value. Optionally takes a symbol as the base name for
+  the gensym."
   ([] (make-fresh-var 'g))
   ([name] {:op :local-binding,
            ;; NB: consider passing in programs ns info
@@ -47,6 +56,9 @@
            :init nil}))
 
 (defn build-invoke-expr
+  "Generates an analyzer-style function invocation expression with rator as
+  the fexpr (function expression/operator) and rand* as the args (arguments
+  list/operands)." 
   [rator rand*]
   {:args rand*,
    :op :invoke,
@@ -65,8 +77,10 @@
    :tag nil})
 
 (defn build-continuation-expr
-  [arg body]
+  "Generates an analyzer-style expression representing a continuation (as a
+  fn expression."
   ;; NB: missing lots of source information here
+  [arg body]
   {:op :fn-expr,
    :env {:line -1, :locals {}, :ns {:name 'clojure.tools.cps}},
    :methods
@@ -87,8 +101,8 @@
    :tag nil})
 
 (def empty-continuation
-  (let [x (make-fresh-var 'x)]
-    (build-continuation-expr x x)))
+  "The empty continuation, represented as the identity function."
+  (build-continuation-expr 'x 'x))
 
 (declare cps-triv cps-srs)
 
@@ -96,6 +110,8 @@
 ;; NB: assuming only required symbol arguments (no rest or arg destructuring)
 ;; NB: also eschewing compatibility for non-CPS calls
 (defn cps-fn
+  "Applies the First Order One Pass CPS algorithm to fn expressions, and
+  returns the analyzer representation for the result."
   [expr]
   (let [k (make-fresh-var 'k)]
     (-> expr
@@ -106,6 +122,8 @@
                (cps-srs % k))))))
     
 (defn cps-app
+  "Applies the First Order One Pass CPS algorithm to function applications,
+  and the returns the analyzer representation for the result."
   [expr k]
   (letfn [(trivit [e]
             (if (trivial-expr? e)
@@ -126,14 +144,26 @@
                   (cps-srs rcall (build-continuation-expr rtriv out)))))))))
                 
 (defn error
+  "Throws a generic exception with its arguments concatenated into a string
+  as the message."
   [& msg]
   (throw (Exception. (apply str msg))))
 
 (defn unsupported!
+  "Convenience function for signalling that a feature isn't supported
+  yet. It gets an awful lot of use currently, and will hopefully be
+  deprecated in the future."
   [expr-str]
   (error (str expr-str " expressions not supported yet")))
 
 (defn cps-triv
+  "Applies the First Order One Pass CPS algorithm to a trivial,
+  analyzer-style expression and returns the result as an analyzer-style
+  expression.
+
+  If expr is not a trivial expression, cps-triv throws an uncaught
+  exception. Note that if this ever occurs, it represents a bug in the
+  implementation."
   [expr]
   (case (:op expr)
     (:var
@@ -161,6 +191,13 @@
     (error "unexpected trivial expression " (emit/emit-form expr))))
 
 (defn cps-srs
+  "Applies the First Order One Pass CPS algorithm to a serious,
+  analyzer-style expression and returns the result as an analyzer-style
+  expression.
+
+  If expr is not a serious expression, cps-srs throws an uncaught
+  exception. Note that if this ever occurs, it represents a bug in the
+  implementation."
   [expr k]
   (case (:op expr)
     :invoke          (cps-app expr k)
@@ -179,6 +216,9 @@
     (error "unexpected serious expression " (emit/emit-form expr))))
 
 (defn cps-expr
+  "Takes an analyzer-style Clojure expression and applies the First Order
+  One Pass CPS algorithm to it, returning the result as an analyzer-style
+  expression."
   [expr]
   (case (:op expr)
     (:var
@@ -208,8 +248,9 @@
          (cps-srs expr (make-fresh-var 'k)))
     (error (str "unexpected expression " expr))))
 
-(defmacro cps
-  [expr]
+(defmacro cps [expr]
+  "Takes a Clojure expression, applies the First Order One Pass CPS
+  algorithm to it, and emits the result."
   (-> expr
       analyze/macroexpand
       analyze/analyze-form
