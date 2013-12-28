@@ -129,16 +129,17 @@
    :else alt})
 
 (defn make-let
-  [bind init body]
-  {:op :let,
-   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
-   :binding-inits
-   (list {:op :binding-init,
-          :env {:locals {}, :ns {:name 'clojure.tools.cps}},
-          :local-binding bind,
-          :init init}),
-   :body body,
-   :is-loop false})
+  [bind* init* body]
+  (letfn [(make-bind [bind init]
+            {:op :binding-init,
+             :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+             :local-binding (assoc bind :init init),
+             :init init})]
+    {:op :let,
+     :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+     :binding-inits (map make-bind bind* init*),
+     :body body,
+     :is-loop false}))
 
 (defn make-do
   [expr*]
@@ -186,8 +187,8 @@
 (defn make-k-test
   [maybe-k]
   (let [meta-var (make-var (var clojure.core/meta))
-        maybe-k-meta (make-app meta-var maybe-k)]
-    (make-app $k-tag-kw maybe-k-meta)))
+        maybe-k-meta (make-app meta-var (list maybe-k))]
+    (make-app $k-tag-kw (list maybe-k-meta))))
 
 (declare cps-triv cps-srs)
 
@@ -215,6 +216,35 @@
     (make-fn-method param*
                     (list (make-app (sym->var-ref fn-name) k+arg*)))))
 
+;; NB: fix this so it doesn't hurt my eyes
+(defn merge-methods
+  [cps-method* compat-method*]
+  (let [get-arg-count (comp count :required-params)
+        cps-arg-count* (map get-arg-count cps-method*)
+        compat-arg-count* (map get-arg-count compat-method*)
+        cps-arg-cnt=>method (zipmap cps-arg-count* cps-method*)
+        compat-arg-cnt=>method (zipmap compat-arg-count* compat-method*)
+        get-first-binding (comp first :required-params)]
+    (for [arg-cnt (set (concat cps-arg-count* compat-arg-count*))
+          :let [cps-method (get cps-arg-cnt=>method arg-cnt)
+                compat-method (get compat-arg-cnt=>method arg-cnt)]]
+      (if (and cps-method compat-method)
+          (let [maybe-k-var (get-first-binding cps-method)
+                cps-param* (:required-params cps-method)
+                ;; have to reverse the bindings since inits can refer to
+                ;; previous bindings (i.e. let* semantics bite us here)
+                compat-body (make-let
+                              (reverse (:required-params compat-method))
+                              (reverse (map make-binding-ref cps-param*))
+                              (:body compat-method))
+                k-test (make-if (make-k-test maybe-k-var)
+                         (:body cps-method)
+                         compat-body)]
+            (make-fn-method cps-param* (list k-test)))
+          (if-let [method (or cps-method compat-method)]
+            method
+            (error "expected method but got nil"))))))
+
 ;; by the time an fn expression is handed to cps-fn, data-structure
 ;; arguments (i.e. argument destructuring) has been expanded so that the
 ;; argument is a simple variable and the destructuring is done in the
@@ -231,9 +261,8 @@
         cps-method* (map cps-method method*)]
     (-> expr
         (assoc :name fn-name)
-        ;; interleaving puts the methods in argument count order
-        (assoc :methods (interleave compat-method* cps-method*)))))
-    
+        (assoc :methods (merge-methods cps-method* compat-method*)))))
+
 (defn cps-app
   "Applies the First Order One Pass CPS algorithm to function applications,
   and the returns the analyzer representation for the result."
