@@ -27,35 +27,29 @@
     ;; NB: probably too general; might bite me later
     :static-method (every? trivial-expr? (:args expr))
     false))
-    
-(defn update-in+
-  "Similar to clojure.core/update-in, except coll may include lists and
-  key* may include references to clojure.core/first so that lists in coll
-  can be traversed."
-  [coll key* f & arg*]
-  (letfn [($update-in+ [coll key*]
-            (if-let [key (first key*)]
-              (let [key* (next key*)]
-                (if (identical? key clojure.core/first)
-                    (conj (next coll) ($update-in+ (first coll) key*))
-                    (assoc coll key ($update-in+ (get coll key) key*))))
-              (apply f coll arg*)))]
-    ($update-in+ coll key*)))
 
-(defn make-fresh-var
-  "Generates an analyzer-style variable expression with a gensym for the
-  variable's symbol value. Optionally takes a symbol as the base name for
-  the gensym."
-  ([] (make-fresh-var 'g))
-  ([name] {:op :local-binding,
-           ;; NB: consider passing in programs ns info
-           ;; NB: this suggests a *ton* of work for error-reporting consistency
-           :env {:locals {} :ns {:name 'clojure.tools.cps}},
-           :sym (gensym name),
-           :tag nil,
-           :init nil}))
+;; TODO: audit AST-as-hash-map-generating functions for code duplictation
+;; NB: should AST-as-hash-map-generating functions be simple recursive
+;; NB: calls to analyze-form?
 
-(defn build-invoke-expr
+(defn make-binding
+  [sym]
+  {:op :local-binding,
+   ;; NB: consider passing in programs ns info
+   ;; NB: this suggests a *ton* of work for error-reporting consistency
+   :env {:locals {} :ns {:name 'clojure.tools.cps}},
+   :sym sym,
+   :tag nil,
+   :init nil})
+
+(defn make-binding-ref
+  [binding]
+  {:op :local-binding-expr,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :local-binding binding,
+   :tag nil})
+
+(defn make-app
   "Generates an analyzer-style function invocation expression with rator as
   the fexpr (function expression/operator) and rand* as the args (arguments
   list/operands)." 
@@ -76,50 +70,169 @@
    :site-index -1,
    :tag nil})
 
-(defn build-continuation-expr
+(defn make-continuation
   "Generates an analyzer-style expression representing a continuation (as a
   fn expression."
   ;; NB: missing lots of source information here
   [arg body]
-  {:op :fn-expr,
-   :env {:line -1, :locals {}, :ns {:name 'clojure.tools.cps}},
-   :methods
-   (list {:op :fn-method,
+  {:args
+   (list {:op :fn-expr,
+          :env {:line -1, :locals {}, :ns {:name 'clojure.tools.cps}},
+          :methods
+          (list {:op :fn-method,
+                 :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+                 :body
+                 {:op :do,
+                  :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+                  :exprs (list body)},
+                 :required-params (list arg),
+                 :rest-param nil}),
+          :variadic-method nil,
+          :tag nil}
+         {:op :constant,
           :env {:locals {}, :ns {:name 'clojure.tools.cps}},
-          :body
-          {:op :do,
-           :env
-           {:source "unknown",
-            :column -1,
-            :line -1,
-            :locals {},
-            :ns {:name 'clojure.tools.cps}},
-           :exprs (list body)},
-          :required-params (list arg),
-          :rest-param nil}),
-   :variadic-method nil,
+          :val {$k-tag true}}),
+   :op :invoke,
+   :protocol-on nil,
+   :is-protocol false,
+   :fexpr
+   {:op :var,
+    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+    ;; NB: not sure if this is the right thing to do in the long run
+    :var (var with-meta),
+    :tag nil},
+   :is-direct false,
+   :env
+   {:source "unknown",
+    :locals {},
+    :ns {:name 'clojure.tools.cps}},
+   :site-index -1,
    :tag nil})
 
-(def empty-continuation
+(defn make-fn-method
+  [param* expr*]
+  {:op :fn-method,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :body
+   {:op :do,
+    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+    :exprs expr*},
+   :required-params param*,
+   :rest-param nil})
+
+(defn make-if
+  [test conseq alt]
+  {:op :if,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :test test,
+   :then conseq,
+   :else alt})
+
+(defn make-let
+  [bind init body]
+  {:op :let,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :binding-inits
+   (list {:op :binding-init,
+          :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+          :local-binding bind,
+          :init init}),
+   :body body,
+   :is-loop false})
+
+(defn make-do
+  [expr*]
+  {:op :do,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :exprs expr*})
+
+(defn make-keyword
+  [key]
+  {:op :keyword,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :val key})
+
+(defn make-var
+  [var]
+  {:op :var,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+   :var var,
+   :tag nil})
+
+(defn make-fresh-var
+  "Generates an analyzer-style variable expression with a gensym for the
+  variable's symbol value. Optionally takes a symbol as the base name for
+  the gensym."
+  ([] (make-fresh-var 'g))
+  ([name] (make-binding (gensym name))))
+
+(def sym->var-ref
+  "Convenience function that takes a symbol representing a variable
+  expression and applies both make-binding and make-binding-ref to it to
+  create a proper variable reference."
+  (comp make-binding-ref make-binding))
+
+(def empty-k
   "The empty continuation, represented as the identity function."
-  (build-continuation-expr 'x 'x))
+  (let [x (make-fresh-var 'x)]
+    (make-continuation x (make-binding-ref x))))
+
+(def $k-tag
+  "Unique tag used to distinguish continuations from other arguments."
+  :kont_es5y2pkhzlx4x7816y9ezl-0)
+
+(def $k-tag-kw (make-keyword $k-tag))
+
+(defn make-k-test
+  [maybe-k]
+  (let [meta-var (make-var (var clojure.core/meta))
+        maybe-k-meta (make-app meta-var maybe-k)]
+    (make-app $k-tag-kw maybe-k-meta)))
 
 (declare cps-triv cps-srs)
 
-;; NB: assuming single-body input fn expressions for now
-;; NB: assuming only required symbol arguments (no rest or arg destructuring)
-;; NB: also eschewing compatibility for non-CPS calls
+;; NB: cps-body is a stand-in for applying CPS to a "do" expression
+(defn cps-body
+  [bexpr* k]
+  (for [bexpr bexpr*]
+    (if (trivial-expr? bexpr)
+      (make-app k (list bexpr))
+      (cps-srs bexpr k))))
+
+(defn cps-method
+  [method]
+  (let [k (make-fresh-var 'k)]
+    (make-fn-method (conj (:required-params method) k)
+                    ;; NB: simply CPS as a do expression once that's
+                    ;; NB: supported
+                    (cps-body (-> method :body :exprs) k))))
+
+(defn build-compat-method
+  [fn-name method]
+  (let [param* (:required-params method)
+        arg* (map make-binding-ref param*)
+        k+arg* (conj arg* empty-k)]
+    (make-fn-method param*
+                    (list (make-app (sym->var-ref fn-name) k+arg*)))))
+
+;; by the time an fn expression is handed to cps-fn, data-structure
+;; arguments (i.e. argument destructuring) has been expanded so that the
+;; argument is a simple variable and the destructuring is done in the
+;; fn body as a let binding.
+;; NB: this implementation doesn't solve the arity clash problem
 (defn cps-fn
   "Applies the First Order One Pass CPS algorithm to fn expressions, and
   returns the analyzer representation for the result."
   [expr]
-  (let [k (make-fresh-var 'k)]
+  (let [fn-name (or (:name expr) (gensym 'fn))
+        method* (:methods expr)
+        compat-method* (map (partial build-compat-method fn-name)
+                            method*)
+        cps-method* (map cps-method method*)]
     (-> expr
-        (update-in+ [:methods first :required-params] conj k)
-        (update-in+ [:methods first :body :exprs first]
-          #(if (trivial-expr? %)
-               (build-invoke-expr k (list %))
-               (cps-srs % k))))))
+        (assoc :name fn-name)
+        ;; interleaving puts the methods in argument count order
+        (assoc :methods (interleave compat-method* cps-method*)))))
     
 (defn cps-app
   "Applies the First Order One Pass CPS algorithm to function applications,
@@ -132,7 +245,7 @@
     ;; NB: this is a den of inefficient things
     (loop [rcall* (reverse (conj (:args expr) (:fexpr expr)))
            rtriv* (map trivit rcall*)
-           out (build-invoke-expr (last rtriv*)
+           out (make-app (last rtriv*)
                  (conj (reverse (butlast rtriv*)) k))]
       (if (and (nil? (seq rcall*)) (nil? (seq rtriv*)))
           out
@@ -141,7 +254,7 @@
             (if (trivial-expr? rcall)
                 (recur rcall* rtriv* out)
                 (recur rcall* rtriv*
-                  (cps-srs rcall (build-continuation-expr rtriv out)))))))))
+                  (cps-srs rcall (make-continuation rtriv out)))))))))
                 
 (defn error
   "Throws a generic exception with its arguments concatenated into a string
@@ -230,7 +343,7 @@
      :fn-expr)
     ,(cps-triv expr)
     :invoke 
-    ,(cps-app expr empty-continuation)
+    ,(cps-app expr empty-k)
     (:def
      :if
      :do
