@@ -9,4 +9,6 @@
 
   :repositories {"sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
   
-  :source-paths ["src/main/clojure"])
+  :source-paths ["src/main/clojure"]
+
+  :repl-options {:init-ns clojure.tools.cps})
