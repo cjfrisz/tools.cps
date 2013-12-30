@@ -192,59 +192,54 @@
 
 (declare cps-triv cps-srs)
 
-;; NB: cps-body is a stand-in for applying CPS to a "do" expression
-(defn cps-body
-  [bexpr* k]
-  (for [bexpr bexpr*]
-    (if (trivial-expr? bexpr)
-      (make-app k (list bexpr))
-      (cps-srs bexpr k))))
+(defn make-arity->k+body
+  "Takes a list of argument counts for the CPS versions of each method
+  and the original methods and returns a hash-map of the arities for
+  the CPS methods associated with the body list of body expressions."
+  [cps-arity* method*]
+  (let [k+body* (for [method method*
+                      :let [k (make-fresh-var 'k)
+                            body (for [expr (-> method :body :exprs)]
+                                   (if (trivial-expr? expr)
+                                       (make-app (make-binding-ref k)
+                                         (list expr))
+                                       (cps-srs expr k)))]]
+                  [k body])]
+    (zipmap cps-arity* k+body*)))
+  
 
-(defn cps-method
-  [method]
-  (let [k (make-fresh-var 'k)]
-    (make-fn-method (conj (:required-params method) k)
-                    ;; NB: simply CPS as a do expression once that's
-                    ;; NB: supported
-                    (cps-body (-> method :body :exprs) k))))
+(defn build-method
+  "Takes an arity, a hash-map of arities associated with parameter
+  lists, an fn name, a continuation parameter name (possibly nil), and
+  a sequence of CPS expression (possibly nil in the same instances as
+  k-param), and returns an appropriate analyzer fn-method, aka a
+  single overload of an fn expression.
 
-(defn build-compat-method
-  [fn-name method]
-  (let [param* (:required-params method)
-        arg* (map make-binding-ref param*)
-        k+arg* (conj arg* empty-k)]
-    (make-fn-method param*
-                    (list (make-app (sym->var-ref fn-name) k+arg*)))))
-
-;; NB: fix this so it doesn't hurt my eyes
-(defn merge-methods
-  [cps-method* compat-method*]
-  (let [get-arg-count (comp count :required-params)
-        cps-arg-count* (map get-arg-count cps-method*)
-        compat-arg-count* (map get-arg-count compat-method*)
-        cps-arg-cnt=>method (zipmap cps-arg-count* cps-method*)
-        compat-arg-cnt=>method (zipmap compat-arg-count* compat-method*)
-        get-first-binding (comp first :required-params)]
-    (for [arg-cnt (set (concat cps-arg-count* compat-arg-count*))
-          :let [cps-method (get cps-arg-cnt=>method arg-cnt)
-                compat-method (get compat-arg-cnt=>method arg-cnt)]]
-      (if (and cps-method compat-method)
-          (let [maybe-k-var (get-first-binding cps-method)
-                cps-param* (:required-params cps-method)
-                ;; have to reverse the bindings since inits can refer to
-                ;; previous bindings (i.e. let* semantics bite us here)
-                compat-body (make-let
-                              (reverse (:required-params compat-method))
-                              (reverse (map make-binding-ref cps-param*))
-                              (:body compat-method))
-                k-test (make-if (make-k-test maybe-k-var)
-                         (:body cps-method)
-                         compat-body)]
-            (make-fn-method cps-param* (list k-test)))
-          (if-let [method (or cps-method compat-method)]
-            method
-            (error "expected method but got nil"))))))
-
+  Note that cps-body should be a do expression once those are
+  supported by cps-expr."
+  [arity arity->param* fn-name k-param cps-body]
+  (let [orig-param* (arity->param* (dec arity))
+        compat-param* (arity->param* arity)
+        cps? (and k-param cps-body orig-param*)
+        compat? (not (nil? compat-param*))
+        param* (if cps? (conj orig-param* k-param) compat-param*)
+        make-compat-call (fn [fn-name param*]
+                           (make-app (-> fn-name
+                                         make-binding
+                                         make-binding-ref)
+                             (conj (map make-binding-ref param*)
+                               empty-k)))]
+    (cond
+      (and cps? compat?) (make-fn-method param*
+                           (list (make-if (make-k-test k-param)
+                                   (make-do cps-body)
+                                   (make-compat-call fn-name param*))))
+      cps? (make-fn-method param* cps-body)
+      compat? (make-fn-method param*
+                (list (make-compat-call fn-name param*)))
+      :else (error "unexpected arg count " (count param*)
+                   " while building fn-method."))))
+                  
 ;; by the time an fn expression is handed to cps-fn, data-structure
 ;; arguments (i.e. argument destructuring) has been expanded so that the
 ;; argument is a simple variable and the destructuring is done in the
@@ -256,12 +251,21 @@
   [expr]
   (let [fn-name (or (:name expr) (gensym 'fn))
         method* (:methods expr)
-        compat-method* (map (partial build-compat-method fn-name)
-                            method*)
-        cps-method* (map cps-method method*)]
+        param** (map :required-params method*)
+        orig-arity* (map count param**)
+        arity->param* (zipmap orig-arity* param**)
+        cps-arity* (map inc orig-arity*)
+        arity->k+body (make-arity->k+body cps-arity* method*)]
     (-> expr
         (assoc :name fn-name)
-        (assoc :methods (merge-methods cps-method* compat-method*)))))
+        (assoc :methods
+          ;; NB: output is slightly nicer to read if this is sorted
+          (for [arity (distinct (concat orig-arity* cps-arity*))
+                :let [[k-param cps-body] (arity->k+body arity)]]
+            (build-method arity arity->param*
+              fn-name
+              k-param
+              cps-body))))))
 
 (defn cps-app
   "Applies the First Order One Pass CPS algorithm to function applications,
