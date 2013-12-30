@@ -2,6 +2,19 @@
   (:require [clojure.tools.analyzer :as analyze]
             [clojure.tools.analyzer.emit-form :as emit]))
 
+(defn error
+  "Throws a generic exception with its arguments concatenated into a string
+  as the message."
+  [& msg]
+  (throw (Exception. (apply str msg))))
+
+(defn unsupported!
+  "Convenience function for signalling that a feature isn't supported
+  yet. It gets an awful lot of use currently, and will hopefully be
+  deprecated in the future."
+  [expr-str]
+  (error (str expr-str " expressions not supported yet")))
+
 ;; NB: probably deficient in the cases covered
 (defn trivial-expr?
   "Takes an expression (as output by analyze-form) and returns a boolean
@@ -28,11 +41,17 @@
     :static-method (every? trivial-expr? (:args expr))
     false))
 
+(def $k-tag
+  "Unique tag used to distinguish continuations from other arguments."
+  :kont_es5y2pkhzlx4x7816y9ezl-0)
+
 ;; TODO: audit AST-as-hash-map-generating functions for code duplictation
 ;; NB: should AST-as-hash-map-generating functions be simple recursive
-;; NB: calls to analyze-form?
+;; NB: calls to analyze-form? probably easier but more computationally
+;; NB: expensive.
 
 (defn make-binding
+  "Generates an analyzer expression for a local binding variable."
   [sym]
   {:op :local-binding,
    ;; NB: consider passing in programs ns info
@@ -43,6 +62,8 @@
    :init nil})
 
 (defn make-binding-ref
+  "Generates an analyzer expression for a reference to a local binding
+  variable."
   [binding]
   {:op :local-binding-expr,
    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
@@ -110,6 +131,8 @@
    :tag nil})
 
 (defn make-fn-method
+  "Generates an anlyzer expression for a fn-method, aka a single
+  overload for a fn expression."
   [param* expr*]
   {:op :fn-method,
    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
@@ -121,6 +144,8 @@
    :rest-param nil})
 
 (defn make-if
+  "Generates an analyzer expression for an if expression with the
+  given test, consequence, and alternative expressions."
   [test conseq alt]
   {:op :if,
    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
@@ -129,6 +154,10 @@
    :else alt})
 
 (defn make-let
+  "Generates an analyzer expression for a let expression that binds
+  each variable expression in bind* to its corresponding init
+  expression in init* with body given by the (singular) body
+  expression."
   [bind* init* body]
   (letfn [(make-bind [bind init]
             {:op :binding-init,
@@ -142,23 +171,33 @@
      :is-loop false}))
 
 (defn make-do
+  "Generates an analyzer expression for a do expression with the given
+  list of expression."
   [expr*]
   {:op :do,
    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
    :exprs expr*})
 
 (defn make-keyword
-  [key]
+  "Generates an analyzer expression for a keyword."
+  [kw]
   {:op :keyword,
    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
-   :val key})
+   :val kw})
 
 (defn make-var
+  "Generates an analyzer expression for a given var. This is used to
+  refer to built-in Clojure functions, i.e. clojure.core/meta and
+  clojure.core/with-meta."
   [var]
   {:op :var,
    :env {:locals {}, :ns {:name 'clojure.tools.cps}},
    :var var,
    :tag nil})
+
+(def $k-tag-kw
+  "The metadata tag for continuations as an analyzer-style keyword."
+  (make-keyword $k-tag))
 
 (defn make-fresh-var
   "Generates an analyzer-style variable expression with a gensym for the
@@ -178,17 +217,15 @@
   (let [x (make-fresh-var 'x)]
     (make-continuation x (make-binding-ref x))))
 
-(def $k-tag
-  "Unique tag used to distinguish continuations from other arguments."
-  :kont_es5y2pkhzlx4x7816y9ezl-0)
-
-(def $k-tag-kw (make-keyword $k-tag))
-
 (defn make-k-test
-  [maybe-k]
+  "Generates the analyzer expression for whether k-var is a
+  continuation, i.e. ($k-tag-kw (meta k-var)). This is used for
+  generating fn-methods that require both a CPS version and a
+  compatibility call."
+  [k-var]
   (let [meta-var (make-var (var clojure.core/meta))
-        maybe-k-meta (make-app meta-var (list maybe-k))]
-    (make-app $k-tag-kw (list maybe-k-meta))))
+        k-var-meta (make-app meta-var (list k-var))]
+    (make-app $k-tag-kw (list k-var-meta))))
 
 (declare cps-triv cps-srs)
 
@@ -280,7 +317,7 @@
            rtriv* (map trivit rcall*)
            out (make-app (last rtriv*)
                  (conj (reverse (butlast rtriv*)) k))]
-      (if (and (nil? (seq rcall*)) (nil? (seq rtriv*)))
+      (if (not-any? (comp nil? seq) [rcall* rtriv*])
           out
           (let [[rcall & rcall*] rcall*
                 [rtriv & rtriv*] rtriv*]
@@ -289,19 +326,6 @@
                 (recur rcall* rtriv*
                   (cps-srs rcall (make-continuation rtriv out)))))))))
                 
-(defn error
-  "Throws a generic exception with its arguments concatenated into a string
-  as the message."
-  [& msg]
-  (throw (Exception. (apply str msg))))
-
-(defn unsupported!
-  "Convenience function for signalling that a feature isn't supported
-  yet. It gets an awful lot of use currently, and will hopefully be
-  deprecated in the future."
-  [expr-str]
-  (error (str expr-str " expressions not supported yet")))
-
 (defn cps-triv
   "Applies the First Order One Pass CPS algorithm to a trivial,
   analyzer-style expression and returns the result as an analyzer-style
@@ -395,8 +419,7 @@
     (error (str "unexpected expression " expr))))
 
 (defmacro cps [expr]
-  "Takes a Clojure expression, applies the First Order One Pass CPS
-  algorithm to it, and emits the result."
+  "Applies a CPS transformation to an arbitrary Clojure expression."
   (-> expr
       analyze/macroexpand
       analyze/analyze-form
