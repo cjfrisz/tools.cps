@@ -1,6 +1,6 @@
 (ns clojure.tools.cps
-  (:require [clojure.tools.analyzer :as analyze]
-            [clojure.tools.analyzer.emit-form :as emit]))
+  (:require [clojure.jvm.tools.analyzer :as analyze]
+            [clojure.jvm.tools.analyzer.emit-form :as emit]))
 
 (defn error
   "Throws a generic exception with its arguments concatenated into a string
@@ -22,7 +22,8 @@
   the First Order One Pass CPS algorithm."
   [expr]
   (case (:op expr)
-    (:number
+    (:nil
+     :number
      :boolean
      :constant
      :string
@@ -120,7 +121,7 @@
    {:op :var,
     :env {:locals {}, :ns {:name 'clojure.tools.cps}},
     ;; NB: not sure if this is the right thing to do in the long run
-    :var (var with-meta),
+    :var #'clojure.core/with-meta,
     :tag nil},
    :is-direct false,
    :env
@@ -132,16 +133,18 @@
 
 (defn make-fn-method
   "Generates an anlyzer expression for a fn-method, aka a single
-  overload for a fn expression."
-  [param* expr*]
-  {:op :fn-method,
-   :env {:locals {}, :ns {:name 'clojure.tools.cps}},
-   :body
-   {:op :do,
+  overload for a fn expression. Optionally takes a rest argument
+  parameter name as its second argument."
+  ([param* expr*] (make-fn-method param* nil expr*))
+  ([param* rest-param expr*]
+   {:op :fn-method,
     :env {:locals {}, :ns {:name 'clojure.tools.cps}},
-    :exprs expr*},
-   :required-params param*,
-   :rest-param nil})
+    :body
+    {:op :do,
+     :env {:locals {}, :ns {:name 'clojure.tools.cps}},
+     :exprs expr*},
+    :required-params param*,
+    :rest-param rest-param}))
 
 (defn make-if
   "Generates an analyzer expression for an if expression with the
@@ -217,17 +220,59 @@
   (let [x (make-fresh-var 'x)]
     (make-continuation x (make-binding-ref x))))
 
+(defn make-keyword-invoke
+  [kw target]
+  {:op :keyword-invoke,
+   :env {:locals {}, :ns {:name 'clojure.tools.cps}},,
+   :kw kw,
+   :tag nil,
+   :target target})
+
+(defn make-recur
+  [bind* arg*]
+  {:op :recur,
+   :env {:locals {},:ns {:name 'clojure.tools.cps}},
+   :loop-locals bind*,
+   :args arg*})
+  
 (defn make-k-test
   "Generates the analyzer expression for whether k-var is a
   continuation, i.e. ($k-tag-kw (meta k-var)). This is used for
   generating fn-methods that require both a CPS version and a
   compatibility call."
   [k-var]
-  (let [meta-var (make-var (var clojure.core/meta))
-        k-var-meta (make-app meta-var (list k-var))]
-    (make-app $k-tag-kw (list k-var-meta))))
+  (let [meta-var (make-var  #'clojure.core/meta)
+        k-var-meta (make-app meta-var (list (make-binding-ref k-var)))]
+    (make-keyword-invoke $k-tag-kw k-var-meta)))
 
 (declare cps-triv cps-srs)
+
+(defn cps-method-body
+  "Takes an analyzer fn-method and returns a CPS version of it. This
+  will likely be deprecated in favor of applying cps-expr to the
+  method's do when that is supported."
+  [method k]
+  (for [expr (-> method :body :exprs)]
+    (if (trivial-expr? expr)
+        (make-app (make-binding-ref k)
+          (list expr))
+        (cps-srs expr k))))
+
+(defn cps-varg-method-body
+  [varg-method k]
+  (let [cps-body (cps-method-body varg-method k)
+        orig-param* (conj (:required-params varg-method) k)
+        last-param (or (last orig-param*) k)
+        rest-param (:rest-param varg-method)
+        last-arg+rest (make-app (make-var #'clojure.core/conj)
+                        (map make-binding-ref
+                          (list rest-param last-param)))
+        recur-with-k (make-recur
+                       (concat orig-param* (list rest-param))
+                       (concat (list empty-k)
+                         (map make-binding-ref (butlast orig-param*))
+                         (list last-arg+rest)))]
+    (list (make-if (make-k-test k) (make-do cps-body) recur-with-k))))
 
 (defn make-arity->k+body
   "Takes a list of argument counts for the CPS versions of each method
@@ -236,48 +281,74 @@
   [cps-arity* method*]
   (let [k+body* (for [method method*
                       :let [k (make-fresh-var 'k)
-                            body (for [expr (-> method :body :exprs)]
-                                   (if (trivial-expr? expr)
-                                       (make-app (make-binding-ref k)
-                                         (list expr))
-                                       (cps-srs expr k)))]]
+                            body (if (:rest-param method)
+                                     (cps-varg-method-body method k)
+                                     (cps-method-body method k))]]
                   [k body])]
     (zipmap cps-arity* k+body*)))
-  
 
-(defn build-method
-  "Takes an arity, a hash-map of arities associated with parameter
-  lists, an fn name, a continuation parameter name (possibly nil), and
-  a sequence of CPS expression (possibly nil in the same instances as
-  k-param), and returns an appropriate analyzer fn-method, aka a
-  single overload of an fn expression.
+(defn build-arity*
+  [farg-method* varg-method]
+  (let [farg-arity* (map (comp count :required-params) farg-method*)]
+    (if (nil? varg-method)
+        farg-arity*
+        (let [varg-min-arity (count (:required-params varg-method))]
+          (concat farg-arity*
+                  (list (if (contains? (set farg-arity*) varg-min-arity)
+                            (inc varg-min-arity)
+                            varg-min-arity)))))))
 
-  Note that cps-body should be a do expression once those are
-  supported by cps-expr."
-  [arity arity->param* fn-name k-param cps-body]
-  (let [orig-param* (arity->param* (dec arity))
-        compat-param* (arity->param* arity)
-        cps? (and k-param cps-body orig-param*)
-        compat? (not (nil? compat-param*))
-        param* (if cps? (conj orig-param* k-param) compat-param*)
-        make-compat-call (fn [fn-name param*]
-                           (make-app (-> fn-name
-                                         make-binding
-                                         make-binding-ref)
-                             (conj (map make-binding-ref param*)
-                               empty-k)))]
+(defn do-build-method*
+  "Takes a sequence of argument counts, a hash-map of argument counts
+  associated with parameter lists, another hash-map of argument counts
+  associated with vectors of a continuation parameter variable and a
+  sequence of CPS expressions representing a function method body, and
+  a fn name and returns a sequence of analyzer fn-methods."
+  [fn-ref arity* arity->param* arity->k+body]
+  (for [arity arity*
+        :let [orig-param* (arity->param* (dec arity))
+              compat-param* (arity->param* arity)
+              [k-param cps-body] (arity->k+body arity)
+              cps? (and k-param cps-body orig-param*)
+              compat? (not (nil? compat-param*))
+              param* (or (and cps? (conj orig-param* k-param))
+                         compat-param*)
+              ;; not used if nil
+              compat-call (and compat?
+                               (make-app fn-ref
+                                 (conj (map make-binding-ref param*)
+                                   empty-k)))]]
     (cond
+      ;; variadic overloads will never have an arity clash
       (and cps? compat?) (make-fn-method param*
                            (list (make-if (make-k-test k-param)
                                    (make-do cps-body)
-                                   (make-compat-call fn-name param*))))
+                                   compat-call)))
       cps? (make-fn-method param* cps-body)
-      compat? (make-fn-method param*
-                (list (make-compat-call fn-name param*)))
+      compat? (make-fn-method param* (list compat-call))
       :else (error "unexpected arg count " (count param*)
-                   " while building fn-method."))))
+              " while building fn-method."))))
+
+(defn build-method*
+  [src-method* fn-name]
+  (let [fn-ref (-> fn-name make-binding make-binding-ref)
+        src-farg-method* (remove :rest-param src-method*)
+        src-varg-method (first (filter :rest-param src-method*))
+        farg-param** (map :required-params src-farg-method*)
+        varg-param* (:required-params src-varg-method)
+        orig-arity* (build-arity* src-farg-method* src-varg-method)
+        _ (prn orig-arity*)
+        arity->param* (zipmap orig-arity*
+                        (concat farg-param** (list varg-param*)))
+        cps-arity* (map inc orig-arity*)
+        arity->k+body (make-arity->k+body cps-arity* src-method*)
+        ;; NB: output is slightly nicer to read if arity* is sorted
+        arity* (distinct (concat orig-arity* cps-arity*))]
+    ;; much like the highlander, there can be only one variadic method
+    (assert (some #{(count (filter :rest-param src-method*))} [0 1]))
+    (do-build-method* fn-ref arity* arity->param* arity->k+body)))
                   
-;; by the time an fn expression is handed to cps-fn, data-structure
+;; by the time a fn expression is handed to cps-fn, data-structure
 ;; arguments (i.e. argument destructuring) has been expanded so that the
 ;; argument is a simple variable and the destructuring is done in the
 ;; fn body as a let binding.
@@ -287,25 +358,46 @@
   returns the analyzer representation for the result."
   [expr]
   (let [fn-name (or (:name expr) (gensym 'fn))
-        method* (:methods expr)
-        param** (map :required-params method*)
-        orig-arity* (map count param**)
-        arity->param* (zipmap orig-arity* param**)
-        cps-arity* (map inc orig-arity*)
-        arity->k+body (make-arity->k+body cps-arity* method*)]
+        method* (build-method* (:methods expr) fn-name)]
     (-> expr
         (assoc :name fn-name)
-        (assoc :methods
-          ;; NB: output is slightly nicer to read if this is sorted
-          (for [arity (distinct (concat orig-arity* cps-arity*))
-                :let [[k-param cps-body] (arity->k+body arity)]]
-            (build-method arity arity->param*
-              fn-name
-              k-param
-              cps-body))))))
+        (assoc :methods method*)
+        (assoc :variadic-method
+          (some #(and (:rest-param %) %) method*)))))
+
+(defn cps-fn
+  [expr]
+  (let [method-info* (map (fn [method]
+                            (let [required-params (:required-params method)
+                                  arity (count required-params)]
+                            {:original-method method
+                             :original-body (:body method)
+                             :required-params required-params
+                             :rest-param (:rest-param method)
+                             :original-arity arity
+                             :cps-arity (inc arity)})
+                       (:methods expr))
+        with-k-param* (map (fn [method-info]
+                             (assoc method-info
+                               :k-param (make-fresh-var 'k)))
+                        method-info*)
+        with-cps-body* (map (fn [method-info]
+                              (assoc method-info
+                                :cps-body (cps-method-body
+                                            (:original-body method-inf0)
+                                            (:k-param method-info))))
+                         with-k-param*)
+        with-compat-body* (map (fn [method-info]
+                                 (if (some (comp (partial = (:cps-arity method-info))
+                                                 :original-arity)
+                                       with-cps-body*)
+                                     (comment build compat body))))
+        (comment adjust minimum arity for variadic method)
+        (comment take care of variadic function building))]
+    (comment merge required params and updated bodies with original methods)))
 
 (defn cps-app
-  "Applies the First Order One Pass CPS algorithm to function applications,
+  "applies the first Order One Pass CPS algorithm to function applications,
   and the returns the analyzer representation for the result."
   [expr k]
   (letfn [(trivit [e]
@@ -336,7 +428,8 @@
   implementation."
   [expr]
   (case (:op expr)
-    (:var
+    (:nil
+     :var
      :local-binding
      :local-binding-expr
      :number
@@ -420,8 +513,9 @@
 
 (defmacro cps [expr]
   "Applies a CPS transformation to an arbitrary Clojure expression."
-  (-> expr
+  (binding [analyze/*eval-ast* false]
+    (-> expr
       analyze/macroexpand
       analyze/analyze-form
       cps-expr
-      emit/emit-form))
+      emit/emit-form)))

@@ -5,7 +5,7 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"}
 
   :dependencies [[org.clojure/clojure "1.5.1"]
-                 [org.clojure/jvm.tools.analyzer "0.5.2"]]
+                 [org.clojure/jvm.tools.analyzer "0.6.0"]]
 
   :repositories {"sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
   
